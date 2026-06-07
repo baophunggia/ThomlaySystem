@@ -7,64 +7,85 @@ namespace Thomlay.Api.Controllers;
 
 [Route("api/[controller]")]
 [ApiController]
+[IgnoreAntiforgeryToken]
 public class StripeWebhookController : ControllerBase
 {
     private readonly CreateDeploymentOrderCommandHandler _handler;
     private readonly IConfiguration _configuration;
+    private readonly ILogger<StripeWebhookController> _logger;
 
-    // Inject Handler trực tiếp theo chuẩn Vanilla CQRS
-    public StripeWebhookController(CreateDeploymentOrderCommandHandler handler, IConfiguration configuration)
+    public StripeWebhookController(
+        CreateDeploymentOrderCommandHandler handler,
+        IConfiguration configuration,
+        ILogger<StripeWebhookController> logger)
     {
         _handler = handler;
         _configuration = configuration;
+        _logger = logger;
     }
 
     [HttpPost]
     public async Task<IActionResult> HandleWebhook()
     {
-        // 1. Đọc luồng dữ liệu thô từ Stripe gửi tới
         var json = await new StreamReader(HttpContext.Request.Body).ReadToEndAsync();
         var endpointSecret = _configuration["Stripe:WebhookSecret"];
 
         try
         {
-            // 2. Xác thực chữ ký điện tử (Chống giả mạo request, cực kỳ quan trọng cho thị trường Mỹ)
             var stripeEvent = EventUtility.ConstructEvent(
                 json,
                 Request.Headers["Stripe-Signature"],
-                endpointSecret
+                endpointSecret,
+                throwOnApiVersionMismatch: false
             );
 
-            // 3. Nếu khách hàng thanh toán thành công
+            _logger.LogInformation("Received Stripe event: {EventType}", stripeEvent.Type);
+
+            // Chỉ xử lý event này trong giai đoạn hiện tại
             if (stripeEvent.Type == EventTypes.CheckoutSessionCompleted)
             {
-                var session = stripeEvent.Data.Object as Session;
-
-                // Trích xuất dữ liệu do frontend gài vào metadata khi tạo link thanh toán
-                var command = new CreateDeploymentOrderCommand
-                {
-                    StripeSessionId = session.Id,
-                    CustomerEmail = session.CustomerDetails?.Email ?? string.Empty,
-                    // Giả định frontend sẽ nhét ID vật phẩm vào Metadata
-                    ArmoryItemId = Guid.Parse(session.Metadata["ArmoryItemId"]),
-                    // Lấy địa chỉ giao hàng do khách nhập thẳng trên form của Stripe
-                    BaseAddress = session.CustomerDetails?.Address?.Line1 ?? "Địa chỉ chưa xác định"
-                };
-
-                // 4. Kích hoạt luồng tạo đơn hàng trong Database
-                await _handler.HandleAsync(command);
+                await HandleCheckoutSessionCompleted(stripeEvent);
+            }
+            else
+            {
+                _logger.LogInformation("Ignored event: {EventType}", stripeEvent.Type);
             }
 
-            return Ok(); // Phản hồi cho Stripe biết hệ thống Thomlay đã nhận được
+            return Ok(); // Phải trả về 200 nhanh
         }
-        catch (StripeException e)
+        catch (StripeException ex)
         {
-            // Lỗi xác thực chữ ký (Có người cố tình gọi API trái phép)
-            return BadRequest(new { error = e.Message });
+            _logger.LogError(ex, "Stripe signature verification failed");
+            return BadRequest("Invalid signature");
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            return StatusCode(500, new { error = "Lỗi xử lý nội bộ tại Căn cứ Thomlay" });
+            _logger.LogError(ex, "Error processing webhook");
+            return StatusCode(500);
         }
+    }
+
+    private async Task HandleCheckoutSessionCompleted(Event stripeEvent)
+    {
+        var session = stripeEvent.Data.Object as Session;
+
+        if (session?.PaymentStatus != "paid")
+        {
+            _logger.LogWarning("Session not paid: {SessionId}", session?.Id);
+            return;
+        }
+
+        var command = new CreateDeploymentOrderCommand
+        {
+            StripeSessionId = session.Id,
+            CustomerEmail = session.CustomerDetails?.Email ?? string.Empty,
+            ArmoryItemId = Guid.Parse(session.Metadata["ArmoryItemId"]
+                ?? throw new InvalidOperationException("Missing ArmoryItemId in metadata")),
+            BaseAddress = session.CustomerDetails?.Address?.Line1
+                         ?? "Địa chỉ chưa xác định"
+        };
+
+        await _handler.HandleAsync(command);
+        _logger.LogInformation("✅ Order created successfully for session {SessionId}", session.Id);
     }
 }
