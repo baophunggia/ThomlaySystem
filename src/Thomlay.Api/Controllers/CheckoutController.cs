@@ -8,10 +8,17 @@ namespace Thomlay.Api.Controllers;
 [ApiController]
 public class CheckoutController : ControllerBase
 {
+    private readonly IConfiguration _configuration;
+
+    public CheckoutController(IConfiguration configuration)
+    {
+        _configuration = configuration;
+    }
+
     [HttpPost("create-session")]
     public ActionResult CreateCheckoutSession([FromBody] CheckoutRequest request)
     {
-        var domain = "http://localhost:5173"; // Tạm thời để localhost của Frontend (Vue/React)
+        var domain = _configuration["Domain"]; // Tạm thời để localhost của Frontend (Vue/React)
 
         var options = new SessionCreateOptions
         {
